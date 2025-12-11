@@ -1,0 +1,12 @@
+@SpringBootTest
+class RealTimeControllerTest {
+
+    @Autowired
+    private RealTimeController controller;
+
+    @Test
+    void testTimeEndpoint() {
+        Map<String, Object> result = controller.getCurrentTime();
+        assertNotNull(result.get("timestamp"));
+    }
+}
