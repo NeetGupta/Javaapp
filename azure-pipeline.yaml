@@ -1,0 +1,154 @@
+trigger:
+  - main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  imageName: 'demo'
+  tag: '$(Build.BuildId)'
+  acrName: 'youracr.azurecr.io'
+
+stages:
+
+# ---------------------------------------------------  
+# 1) Build Stage  
+# ---------------------------------------------------
+- stage: Build
+  jobs:
+    - job: Build_Job
+      steps:
+        - task: Maven@3
+          inputs:
+            mavenPomFile: 'pom.xml'
+            goals: 'clean package'
+
+        - publish: $(System.DefaultWorkingDirectory)/target
+          artifact: jarFiles
+
+# ---------------------------------------------------  
+# 2) Unit Tests  
+# ---------------------------------------------------
+- stage: Unit_Test
+  dependsOn: Build
+  jobs:
+    - job: UnitTests
+      steps:
+        - task: Maven@3
+          inputs:
+            mavenPomFile: 'pom.xml'
+            goals: 'test'
+
+# ---------------------------------------------------  
+# 3) SonarQube Analysis  
+# ---------------------------------------------------
+- stage: SonarScan
+  dependsOn: Unit_Test
+  jobs:
+    - job: Sonar
+      steps:
+        - task: SonarQubePrepare@5
+          inputs:
+            SonarQube: 'sonar-service-connection'
+            scannerMode: 'Other'
+            extraProperties: |
+              sonar.projectKey=demo
+              sonar.projectName=demo
+
+        - task: Maven@3
+          inputs:
+            mavenPomFile: 'pom.xml'
+            goals: 'verify sonar:sonar'
+
+# ---------------------------------------------------  
+# 4) Docker Image Build & Push  
+# ---------------------------------------------------
+- stage: Build_Image
+  dependsOn: SonarScan
+  jobs:
+    - job: Docker_Build_Push
+      steps:
+        - task: Docker@2
+          inputs:
+            command: buildAndPush
+            repository: '$(imageName)'
+            containerRegistry: 'ACR-Service-Connection'
+            Dockerfile: '**/Dockerfile'
+            tags: |
+              $(tag)
+
+# ---------------------------------------------------  
+# 5) Image Scan using Trivy  
+# ---------------------------------------------------
+- stage: ScanImage
+  dependsOn: Build_Image
+  jobs:
+    - job: TrivyScan
+      steps:
+        - bash: |
+            sudo apt-get update -y
+            sudo apt-get install wget -y
+            wget https://github.com/aquasecurity/trivy/releases/latest/download/trivy_0.44.0_Linux-64bit.deb
+            sudo dpkg -i trivy_0.44.0_Linux-64bit.deb
+            trivy image $(acrName)/$(imageName):$(tag)
+          displayName: "Scan Docker Image with Trivy"
+
+# ---------------------------------------------------  
+# 6) Deploy to AKS (NO HELM)  
+# ---------------------------------------------------
+- stage: Deploy
+  dependsOn: ScanImage
+  jobs:
+    - job: DeployToAKS
+      steps:
+        - task: Kubernetes@1
+          displayName: "Apply Namespace"
+          inputs:
+            connectionType: 'Azure Resource Manager'
+            azureSubscriptionEndpoint: 'AKS-Service-Connection'
+            azureResourceGroup: 'your-rg'
+            kubernetesCluster: 'your-aks-cluster'
+            namespace: ''
+            command: apply
+            useConfigurationFile: true
+            configuration: 'k8s/namespace.yaml'
+
+        - task: Kubernetes@1
+          displayName: "Apply Deployment"
+          inputs:
+            connectionType: 'Azure Resource Manager'
+            azureSubscriptionEndpoint: 'AKS-Service-Connection'
+            azureResourceGroup: 'your-rg'
+            kubernetesCluster: 'your-aks-cluster'
+            namespace: ''
+            command: apply
+            useConfigurationFile: true
+            configuration: 'k8s/deployment.yaml'
+
+        - task: Kubernetes@1
+          displayName: "Apply Service"
+          inputs:
+            connectionType: 'Azure Resource Manager'
+            azureSubscriptionEndpoint: 'AKS-Service-Connection'
+            azureResourceGroup: 'your-rg'
+            kubernetesCluster: 'your-aks-cluster'
+            namespace: ''
+            command: apply
+            useConfigurationFile: true
+            configuration: 'k8s/service.yaml'
+
+# ---------------------------------------------------  
+# 7) Smoke Test  
+# ---------------------------------------------------
+- stage: SmokeTest
+  dependsOn: Deploy
+  jobs:
+    - job: Test
+      steps:
+        - bash: |
+            echo "Fetching External IP..."
+            external_ip=$(kubectl get svc demo-service -n demo-ns -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+            echo "External IP: $external_ip"
+            echo "Testing API..."
+            curl http://$external_ip/api/time
+          displayName: "Smoke Test API"
